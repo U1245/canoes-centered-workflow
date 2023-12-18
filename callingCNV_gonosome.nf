@@ -1,0 +1,206 @@
+#!/usr/bin/env nextflow
+/*****************************************************  
+ *--------------------NEXTFLOW-----------------------*
+ *****************************************************  
+ * NGS pipeline processes for CANOES analysis        * 
+ * Can be configured using nextflow settings         * 
+ ***************************************************** 
+ * Version : v1.0.0                                  * 
+ ***************************************************** 
+ * #### Authors                                      *
+ * Olivier Quenez   <olivier.quenez@inserm.fr>       * 
+ * Sophie Coutant   <sophie.coutant@inserm.fr>       * 
+ ****************************************************/
+
+/*** Assuming Nextflow to be launched from run folder* 
+ * ------------------------------------------------- * 
+ *** ---- Command to use to launch Nextflow : ---- *** 
+ * --------------------------------------------------* 
+ *---> nextflow callingCNV_gonosome.nf \             *
+ *     -c project.config \                           *
+ *     -c calling.config \                           *
+ *     -with-report NextflowProcess-report.html \    *
+ *     -with-trace trace.txt                         *
+ ****************************************************/
+
+kit_file	= file(params.kit)
+srcFolder	= file(params.srcFolder)
+project		= params.projectName
+bam_ch		= Channel.fromFilePairs(params.bams)
+reference 	= file(params.reference)
+installFolder	= file(params.installFolder)
+annotSV		= file(params.annotSVfolder)
+gatk		= params.GATK
+
+	/**************************************
+ 	 *--------Redefine captureKit---------*
+ 	 *************************************/
+
+process 'defineTarget'{
+
+	cpus 1
+
+	input :
+		file(kit_File) from kit_file
+	output :
+		file("extendKit.bed") into (extendedKit_ch,gcCountKit_ch)
+	script :
+	"""
+                bedtools merge -d 30 -i $kit_file > tmp2
+                sort -k 1,1 -k2,2n tmp2 > extendKit.bed
+	"""
+}
+
+        /**************************************
+         *---------Calculate GC ratio---------*
+         *************************************/
+
+process 'gcCount'{
+	cpus 1
+
+	input :
+		file kitExtended from gcCountKit_ch
+	output :
+		file ("gcCount.txt") into gcCount_ch
+	script :
+	"""
+		java -Xmx2g -jar $gatk -T GCContentByInterval -L $kitExtended -R $reference -o gcCount.txt
+	"""
+}
+
+        /**************************************
+         *-----ReadCount for each sample------*
+         *************************************/
+
+process 'countReads'{
+	tag "${sampleId}"
+        publishDir "${srcFolder}/READCOUNT/", mode : 'copy'
+	maxForks 32
+	cpus 1
+	
+	input :
+		set sampleId, file(bam) from bam_ch
+		file (target) from extendedKit_ch
+	output :
+		file("${sampleId}.reads.txt") into read_ch
+	script :
+	"""
+		bedtools multicov -bams ${bam[0]} -bed $target -q 20 > ${sampleId}.reads.txt
+	"""
+}
+
+        /**************************************
+         *---------Regroup readCount----------*
+         *************************************/
+
+process 'compilSample'{
+
+	tag "${project}"
+	cpus 1
+	input :
+		file(read) from read_ch.collect()
+
+	output :
+		set file("sample.list"), file("${project}.reads.txt") into projectRead_ch
+		file "${project}.sample.list" into sampleSplit_ch
+	script :
+	"""
+		echo -e "${read.join('\n')}" | sed -e "s/\\.reads\\.txt//" > ${project}.sample.list
+		perl $installFolder/compilSample.pl -sample ${project}.sample.list -output ${project}.reads.txt
+	"""
+
+}
+
+       /*****************************************************************************
+         *cleanEntries:                                                              *
+	 *- remove Region with more than 90% of the sample above 10 reads            *
+	 *- check for "chr" before the chromosome name, avoid sorting error in CANOES*
+	 *- generate two file with the same number of rows                           *
+	 *- change X and Y chromosome to 23 and 24                                   *
+         ****************************************************************************/
+
+process 'cleanEntries'{
+	publishDir "${srcFolder}/READCOUNT/", mode : 'copy'
+	tag "$project"
+	cpus 1
+	input :
+		set file(samples), file (reads) from projectRead_ch
+		file gcCount from gcCount_ch
+	output :
+		set file(samples), file ("${project}.clean.reads.txt"), file ("${project}.clean.gc.txt") into cleanEntries_ch
+	script :
+	"""
+		perl $installFolder/cleanCANOESentriesForGonosome.pl --gc $gcCount --reads $reads --outPrefix ${project}.clean
+		sed -e \"s/^X/23/\" ${project}.clean.reads.txt | sed -e \"s/^Y/24/\"> tmp
+		mv tmp ${project}.clean.reads.txt
+		sed -e \"s/^X/23/\" ${project}.clean.gc.txt | sed -e \"s/^Y/24/\"> tmp
+		mv tmp ${project}.clean.gc.txt
+		
+	"""
+}
+
+sample_ch = sampleSplit_ch.splitText()
+
+        /**************************************
+         *--------CANOES CNV calling----------*
+         *************************************/
+
+process 'callingCNV'{
+	tag "$sampleId"
+	cpus 1
+	errorStrategy 'ignore'
+	maxForks 32
+	input :
+		val sampleId from sample_ch
+		set file(samples), file(reads), file(gc) from cleanEntries_ch 
+	output :
+		set sampleId, file ("${sampleId}.cnv.csv") into callCNVraw_ch
+	script :
+		sampleId=sampleId.replaceFirst(/\n/,"")
+	"""
+		Rscript $installFolder/run_monoCANOES.R $installFolder/CANOESForGonosome.R $gc $reads $samples $sampleId
+
+	"""
+}
+
+        /***************************************
+         *--Conversion from csv to Bed Format--*
+         **************************************/
+
+process 'csvToBed'{
+	tag "$sampleId"
+	publishDir "${srcFolder}/CANOES/", mode : 'copy'
+	cpus 1
+	errorStrategy 'ignore'
+	input :
+		set sampleId, file (csvFile) from callCNVraw_ch
+	output :
+		set sampleId, file ("${sampleId}.cnv.bed") into callCNV_ch
+		
+	script :
+	"""
+		touch ${sampleId}.cnv.bed
+		perl $installFolder/extractToBedFormat.pl -in $csvFile -out ${sampleId}.cnv.bed
+		sed -e \"s/^23/X/\" ${sampleId}.cnv.bed | sed -e \"s/^24/Y/\"> tmp
+		mv tmp ${sampleId}.cnv.bed
+	"""
+}
+        /**************************************
+         *-------Annotate using annotSV-------*
+         *************************************/
+
+process 'annotSV'{
+	tag "$sampleId"
+	publishDir "${srcFolder}/CANOES/", mode : 'copy'
+        cpus 1
+        errorStrategy 'ignore'
+	input :
+		set sampleId, file (cnv) from callCNV_ch
+	output :
+		set sampleId, file ("${sampleId}.cnv.annot.tsv") into annotCNV_ch
+	script :
+	"""
+		export ANNOTSV=$annotSV
+		\$ANNOTSV/bin/AnnotSV/AnnotSV.tcl -SVinputFile $cnv -SVinputInfo 1 -outputDir . -outputFile ${sampleId}.cnv.annot.tsv
+	"""
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env nextflow
-nextflow.enable.dsl = 1
+
 /*****************************************************  
  *--------------------NEXTFLOW-----------------------*
  *****************************************************  
@@ -28,11 +28,9 @@ nextflow.enable.dsl = 1
 
 kit_file	= file(params.kit)
 srcFolder	= file(params.srcFolder)
-project		= params.projectName
+project		= params.project
 bam_ch		= Channel.fromFilePairs(params.bams)
 installFolder	= file(params.installFolder)
-annotSV		= file(params.annotSVfolder)
-gatk		= params.GATK
 reference 	= file(params.reference)
 canoes		= params.CANOES
 
@@ -43,6 +41,7 @@ canoes		= params.CANOES
 process 'defineTarget'{
 
 	cpus 1
+	module 'bedtools'
 
 	input :
 		file(kit_File) from kit_file
@@ -61,6 +60,7 @@ process 'defineTarget'{
 
 process 'gcCount'{
 	cpus 1
+	module 'gatk'
 
 	input :
 		file kitExtended from gcCountKit_ch
@@ -68,7 +68,7 @@ process 'gcCount'{
 		file ("gcCount.txt") into gcCount_ch
 	script :
 	"""
-		java -Xmx2g -jar $gatk -T GCContentByInterval -L $kitExtended -R $reference -o gcCount.txt
+		gatk3 -Xmx2g -T GCContentByInterval -L $kitExtended -R $reference -o gcCount.txt
 	"""
 }
 
@@ -79,6 +79,7 @@ process 'gcCount'{
 process 'countReads'{
 	tag "${sampleId}"
         publishDir "${srcFolder}/READCOUNT/", mode : 'copy'
+	module 'bedtools'
 	maxForks 36
 	cpus 1
 	
@@ -99,7 +100,6 @@ process 'countReads'{
          *************************************/
 
 process 'compilSample'{
-
 	tag "${project}"
 	cpus 1
 	input :
@@ -146,6 +146,8 @@ sample_ch = sampleSplit_ch.splitText()
 
 process 'callingCNV'{
 	tag "$sampleId"
+	module 'canoes'
+	errorStrategy 'ignore'
 	cpus 1
 	input :
 		val sampleId from sample_ch
@@ -189,6 +191,7 @@ process 'annotSV'{
 	tag "$sampleId"
 	publishDir "${srcFolder}/CANOES/", mode : 'copy'
         cpus 1
+	module 'annotsv'
         errorStrategy 'ignore'
 	input :
 		set sampleId, file (cnv) from callCNV_ch
@@ -196,7 +199,6 @@ process 'annotSV'{
 		set sampleId, file ("${sampleId}.cnv.annot.tsv") into annotCNV_ch
 	script :
 	"""	
-		export ANNOTSV=$annotSV
-		\$ANNOTSV/bin/AnnotSV -SVinputFile $cnv -SVinputInfo 1 -outputDir . -outputFile ${sampleId}.cnv.annot.tsv
+		\$ANNOTSV/bin/AnnotSV -SVinputFile $cnv -SVinputInfo 1 -outputDir . -outputFile ${sampleId}.cnv.annot.tsv -genomeBuild GRCh37 -svtBEDcol 5
 	"""
 }
